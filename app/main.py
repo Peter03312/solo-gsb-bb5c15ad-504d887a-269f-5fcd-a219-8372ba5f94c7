@@ -9,19 +9,31 @@ POST   /api/applications/{id}/preview            conflicts + current revision
 POST   /api/applications/{id}/approve            conditional approval (expected rev.)
 POST   /api/applications/batch-approve           conditional whole-group approval
 POST   /api/applications/{id}/revoke             revoke (changes future effective set)
+POST   /api/applications/{id}/amendments         amend an effective license's scope
 GET    /api/revision/current                     current revision + effective set
 GET    /api/revision/{revision}                  as-of snapshot (approvals/revocations)
 GET    /health                                   liveness probe
 
 Concurrency
 -----------
-Every mutation (single approval, group approval and revocation) locks the
-singleton ``revision_meta`` row (``SELECT ... FOR UPDATE``) for the duration
-of the transaction.  The three operations therefore share one revision
-adjudication and serialise: a group approval either commits all its approval
-events at once with consecutive revisions or commits nothing, and a loser
-transaction is refused with ``stale_revision`` / ``interference`` (or the
-group-level ``batch_rejected`` envelope carrying every failure category).
+Every mutation (single approval, group approval, revocation and scope
+amendment) locks the singleton ``revision_meta`` row (``SELECT ... FOR
+UPDATE``) for the duration of the transaction.  The four operations
+therefore share one revision adjudication and serialise: a group approval
+either commits all its approval events at once with consecutive revisions or
+commits nothing, and a loser transaction is refused with ``stale_revision``
+/ ``interference`` (or the group-level ``batch_rejected`` envelope carrying
+every failure category).
+
+Amendments
+----------
+An amendment replaces the *effective scope* (circle/band/window) of one
+already approved, not revoked license at one new revision; the license id
+and approved status never change.  Under the lock the license's old scope is
+excluded from the effective set and the new scope is adjudicated against the
+remaining effective licenses with the ordinary rules.  The append-only
+``amendment_events`` table keeps every scope (plus the previous scope), so
+an as-of query at an old revision still renders the parameters in force then.
 """
 from __future__ import annotations
 
@@ -41,18 +53,24 @@ from .config import settings
 from .db import SessionLocal, engine, init_db, wait_for_database
 from .errors import APIError, api_error_handler
 from .models import (
+    AmendmentEvent,
     Application,
     ApprovalEvent,
     RevisionMeta,
     RevocationEvent,
 )
 from .schemas import (
+    AmendmentRequest,
     ApplicationCreate,
     ApprovalRequest,
     BatchApprovalRequest,
     RevocationRequest,
 )
-from .semantic_validation import validate_application, validate_batch_application_ids
+from .semantic_validation import (
+    validate_amendment,
+    validate_application,
+    validate_batch_application_ids,
+)
 
 log = logging.getLogger("radio.api")
 
@@ -82,15 +100,27 @@ def iso(value: datetime) -> str:
     return _utc(value).isoformat().replace("+00:00", "Z")
 
 
-def serialize_application(app: Application) -> dict[str, Any]:
+def serialize_application(
+    app: Application,
+    latest_amendment: AmendmentEvent | None = None,
+) -> dict[str, Any]:
+    scope = latest_amendment if latest_amendment is not None else app
     return {
         "id": app.id,
         "name": app.name,
-        "circle": {"cx": app.cx, "cy": app.cy, "radius": app.radius},
-        "frequency": {"low": app.freq_low, "high": app.freq_high},
-        "time_window": {"start": iso(app.start_time), "end": iso(app.end_time)},
+        "circle": {"cx": scope.cx, "cy": scope.cy, "radius": scope.radius},
+        "frequency": {"low": scope.freq_low, "high": scope.freq_high},
+        "time_window": {
+            "start": iso(scope.start_time),
+            "end": iso(scope.end_time),
+        },
         "status": app.status,
         "approval_revision": app.approval_revision,
+        # Revision at which the current scope was last replaced (null when
+        # the effective scope is still the original approved scope).
+        "amendment_revision": (
+            latest_amendment.revision if latest_amendment is not None else None
+        ),
         "created_at": iso(app.created_at),
     }
 
@@ -142,25 +172,108 @@ def serialize_batch_conflict(
 
 
 def to_license(app: Application) -> License:
+    return to_license_from(app)
+
+
+def to_license_from(row, application_id: int | None = None) -> License:
+    """Build an adjudicator license from a scope-bearing row.
+
+    Accepts an ``Application`` (scope columns are the original parameters,
+    id column is ``id``) or an ``AmendmentEvent`` (scope columns are the
+    replacement parameters, id column is ``application_id``).
+    """
+    if application_id is None:
+        application_id = getattr(row, "application_id", None) or row.id
     return License(
-        application_id=app.id,
-        circle=Circle(app.cx, app.cy, app.radius),
-        freq_low=app.freq_low,
-        freq_high=app.freq_high,
-        start_time=_utc(app.start_time),
-        end_time=_utc(app.end_time),
+        application_id=application_id,
+        circle=Circle(row.cx, row.cy, row.radius),
+        freq_low=row.freq_low,
+        freq_high=row.freq_high,
+        start_time=_utc(row.start_time),
+        end_time=_utc(row.end_time),
     )
 
 
-def load_effective_licenses(session) -> list[License]:
-    """Approved and not (yet) revoked = the effective set for adjudication."""
+def load_latest_amendments(
+    session, at_revision: int | None = None
+) -> dict[int, AmendmentEvent]:
+    """Latest amendment event *at* ``at_revision`` per application.
+
+    When ``at_revision`` is None every amendment is eligible (current
+    world); otherwise only amendments with revision <= ``at_revision`` count,
+    which is how as-of snapshots restore the scope in force at the time.
+    Applications that were never amended are simply absent from the map.
+    """
+    query = session.query(AmendmentEvent)
+    if at_revision is not None:
+        query = query.filter(AmendmentEvent.revision <= at_revision)
+    latest: dict[int, AmendmentEvent] = {}
+    for ev in query.order_by(AmendmentEvent.revision).all():
+        latest[ev.application_id] = ev
+    return latest
+
+
+def load_effective_licenses(
+    session,
+    at_revision: int | None = None,
+    amendments: dict[int, AmendmentEvent] | None = None,
+) -> list[License]:
+    """Approved and not (yet) revoked = the effective set for adjudication.
+
+    Each license carries the scope in force at ``at_revision``: its latest
+    amendment not later than that revision, or the original parameters when
+    it was never amended by then.
+    """
     rows = (
         session.query(Application)
         .filter(Application.status == "approved")
         .order_by(Application.id)
         .all()
     )
-    return [to_license(row) for row in rows]
+    if amendments is None:
+        amendments = load_latest_amendments(session, at_revision)
+    licenses = []
+    for row in rows:
+        scope = amendments.get(row.id, row)
+        licenses.append(to_license_from(scope, application_id=row.id))
+    return licenses
+
+
+def serialize_amendment(ev: AmendmentEvent) -> dict[str, Any]:
+    """One scope-replacement event with the new and the previous scope."""
+    return {
+        "revision": ev.revision,
+        "application_id": ev.application_id,
+        "scope": {
+            "circle": {
+                "cx": ev.cx,
+                "cy": ev.cy,
+                "radius": ev.radius,
+            },
+            "frequency": {"low": ev.freq_low, "high": ev.freq_high},
+            "time_window": {
+                "start": iso(ev.start_time),
+                "end": iso(ev.end_time),
+            },
+        },
+        "previous_scope": {
+            "circle": {
+                "cx": ev.previous_cx,
+                "cy": ev.previous_cy,
+                "radius": ev.previous_radius,
+            },
+            "frequency": {
+                "low": ev.previous_freq_low,
+                "high": ev.previous_freq_high,
+            },
+            "time_window": {
+                "start": iso(ev.previous_start_time),
+                "end": iso(ev.previous_end_time),
+            },
+        },
+        "reason": ev.reason,
+        "created_at": iso(ev.created_at),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -171,7 +284,10 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
 
     Returns every approval event with revision <= the target and the
     application snapshot, flags those later revoked by the target revision,
-    and includes all revocation events of the period.
+    and includes all revocation and amendment events of the period.  The
+    application embedded in every approval record is rendered with the scope
+    in force at the target revision (its latest amendment <= the revision),
+    so querying an old revision still shows the parameters effective then.
     """
     approvals = (
         session.query(ApprovalEvent)
@@ -183,6 +299,13 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         session.query(RevocationEvent)
         .filter(RevocationEvent.revision <= revision)
         .order_by(RevocationEvent.revision)
+        .all()
+    )
+    amendments_by_app = load_latest_amendments(session, at_revision=revision)
+    amendments = (
+        session.query(AmendmentEvent)
+        .filter(AmendmentEvent.revision <= revision)
+        .order_by(AmendmentEvent.revision)
         .all()
     )
     revoked_at_or_before = {ev.application_id: ev for ev in revocations}
@@ -200,7 +323,13 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
             "created_at": iso(ev.created_at),
             # Status of this grant *as of the queried revision*.
             "status_as_of": "revoked" if was_revoked_by_then else "approved",
-            "application": serialize_application(app) if app else None,
+            "application": (
+                serialize_application(
+                    app, amendments_by_app.get(ev.application_id)
+                )
+                if app
+                else None
+            ),
         }
         if was_revoked_by_then:
             record["revoked_at_revision"] = rev.revision
@@ -223,6 +352,7 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
         "effective_application_ids": effective_ids,
         "approvals": approval_records,
         "revocations": revocation_records,
+        "amendments": [serialize_amendment(ev) for ev in amendments],
     }
 
 
@@ -245,7 +375,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Temporary Event Radio Spectrum API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Submit, preview, approve and revoke temporary radio applications. "
         "Frequencies are closed intervals, UTC times are half-open intervals, "
@@ -295,8 +425,9 @@ def current_revision() -> dict[str, Any]:
         meta = session.get(RevisionMeta, 1)
         revision = meta.revision if meta else 0
         snapshot = build_snapshot(session, revision)
+        amendments = load_latest_amendments(session, revision)
         effective_applications = [
-            serialize_application(app)
+            serialize_application(app, amendments.get(app_id))
             for app_id in snapshot["effective_application_ids"]
             if (app := session.get(Application, app_id)) is not None
         ]
@@ -307,6 +438,7 @@ def current_revision() -> dict[str, Any]:
         "effective_applications": effective_applications,
         "approvals": snapshot["approvals"],
         "revocations": snapshot["revocations"],
+        "amendments": snapshot["amendments"],
     }
 
 
@@ -375,7 +507,14 @@ def list_applications(status: str | None = None) -> dict[str, Any]:
                 )
             query = query.filter(Application.status == status)
         rows = query.all()
-        return {"applications": [serialize_application(row) for row in rows]}
+        # Render every effective license with its current (possibly amended)
+        # scope; pending applications never have amendment events.
+        amendments = load_latest_amendments(session)
+        return {
+            "applications": [
+                serialize_application(row, amendments.get(row.id)) for row in rows
+            ]
+        }
 
 
 @app.get("/api/applications/{application_id}", tags=["applications"])
@@ -388,7 +527,8 @@ def get_application(application_id: int) -> dict[str, Any]:
                 f"application {application_id} does not exist",
                 status_code=404,
             )
-        return serialize_application(row)
+        amendments = load_latest_amendments(session)
+        return serialize_application(row, amendments.get(row.id))
 
 
 # --------------------------------------------------------------------------- #
@@ -414,7 +554,7 @@ def preview_application(application_id: int) -> dict[str, Any]:
             )
 
         current = session.get(RevisionMeta, 1).revision
-        effective = load_effective_licenses(session)
+        effective = load_effective_licenses(session, current)
         conflicts = adjudication.evaluate(to_license(row), effective, settings.guard_band)
 
     return {
@@ -477,7 +617,7 @@ def approve_application(
                     )
 
                 # Re-adjudicate under the lock against the latest effective set.
-                effective = load_effective_licenses(session)
+                effective = load_effective_licenses(session, current)
                 conflicts = adjudication.evaluate(
                     to_license(row), effective, settings.guard_band
                 )
@@ -588,7 +728,7 @@ def approve_applications_batch(
                 # still participates, so the operator sees every pairwise
                 # conflict). Nothing here is committed when the group fails.
                 granted_licenses: list[License] = []
-                effective = load_effective_licenses(session)
+                effective = load_effective_licenses(session, current)
                 id_to_index = {
                     app_id: i for i, app_id in enumerate(payload.application_ids)
                 }
@@ -768,6 +908,210 @@ def revoke_application(
             raise APIError(
                 E_STALE_REVISION,
                 f"the revision advanced concurrently (now {latest}); retry",
+                status_code=409,
+                details={"current_revision": latest},
+            )
+    return response
+
+
+# --------------------------------------------------------------------------- #
+# Amend (atomically replace an effective license's scope with a new revision)
+# --------------------------------------------------------------------------- #
+@app.post("/api/applications/{application_id}/amendments", tags=["applications"])
+def amend_application(
+    application_id: int, payload: AmendmentRequest
+) -> dict[str, Any]:
+    """Replace the effective scope of an approved-and-not-revoked license.
+
+    Rules (mirroring single approval):
+
+    * the whole new scope is semantically validated exactly like a new
+      application (``validation_failed`` 422 listing every violation);
+    * the license must exist (404 ``not_found``), be approved and still
+      effective (409 ``not_pending`` when pending, ``already_revoked`` when
+      revoked);
+    * ``expected_revision`` must equal the current revision (409
+      ``stale_revision``), all under the shared row lock;
+    * inside the lock the license's *old* scope is removed from the
+      effective set and the *new* scope is adjudicated against every other
+      effective license with the ordinary interference rules (409
+      ``interference``);
+    * on success exactly one revision is consumed, one ``AmendmentEvent`` is
+      appended (new + previous scope), and the id/approved status are
+      untouched.  Old revisions still reconstruct with the old parameters.
+    """
+    errors = validate_amendment(payload)
+    if errors:
+        raise APIError(
+            E_VALIDATION,
+            "the whole amendment was rejected due to invalid fields",
+            status_code=422,
+            details=errors,
+        )
+
+    new_start = payload.time_window.start.astimezone(timezone.utc)
+    new_end = payload.time_window.end.astimezone(timezone.utc)
+
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                # Same singleton lock as approve/batch/revoke.
+                meta = session.get(RevisionMeta, 1, with_for_update=True)
+                current = meta.revision
+
+                row = session.get(Application, application_id)
+                if row is None:
+                    raise APIError(
+                        E_NOT_FOUND,
+                        f"application {application_id} does not exist",
+                        status_code=404,
+                    )
+                if row.status == "revoked":
+                    raise APIError(
+                        E_ALREADY_REVOKED,
+                        f"application {application_id} has been revoked and "
+                        "cannot be amended",
+                        status_code=409,
+                    )
+                if row.status != "approved":
+                    raise APIError(
+                        E_NOT_PENDING,
+                        f"application {application_id} is {row.status}; only "
+                        "approved, effective licenses can be amended",
+                        status_code=409,
+                        details={"status": row.status},
+                    )
+
+                if payload.expected_revision != current:
+                    raise APIError(
+                        E_STALE_REVISION,
+                        f"expected revision {payload.expected_revision} but "
+                        f"current revision is {current}; re-check and retry "
+                        "the amendment",
+                        status_code=409,
+                        details={
+                            "expected_revision": payload.expected_revision,
+                            "current_revision": current,
+                        },
+                    )
+
+                amendments = load_latest_amendments(session, current)
+                previous = amendments.get(application_id, row)
+
+                # Exclude this license's OWN old scope, then adjudicate the
+                # new scope against every remaining effective license.
+                other_licenses = [
+                    lic
+                    for lic in load_effective_licenses(
+                        session, current, amendments
+                    )
+                    if lic.application_id != application_id
+                ]
+
+                candidate = License(
+                    application_id=application_id,
+                    circle=Circle(
+                        payload.circle.cx,
+                        payload.circle.cy,
+                        payload.circle.radius,
+                    ),
+                    freq_low=payload.frequency.low,
+                    freq_high=payload.frequency.high,
+                    start_time=new_start,
+                    end_time=new_end,
+                )
+                conflicts = adjudication.evaluate(
+                    candidate, other_licenses, settings.guard_band
+                )
+                if conflicts:
+                    raise APIError(
+                        E_INTERFERENCE,
+                        f"the amended scope of application {application_id} "
+                        f"interferes with {len(conflicts)} effective "
+                        "grant(s); the old scope stays in effect",
+                        status_code=409,
+                        details={
+                            "current_revision": current,
+                            "revised": False,
+                            "conflicts": [
+                                serialize_conflict(c) for c in conflicts
+                            ],
+                        },
+                    )
+
+                # Atomic scope replacement: one append-only event + one
+                # revision. The applications row keeps its id and status; the
+                # new scope is served by the amendment event from now on.
+                meta.revision = current + 1
+                event = AmendmentEvent(
+                    revision=meta.revision,
+                    application_id=application_id,
+                    cx=payload.circle.cx,
+                    cy=payload.circle.cy,
+                    radius=payload.circle.radius,
+                    freq_low=payload.frequency.low,
+                    freq_high=payload.frequency.high,
+                    start_time=new_start,
+                    end_time=new_end,
+                    previous_cx=previous.cx,
+                    previous_cy=previous.cy,
+                    previous_radius=previous.radius,
+                    previous_freq_low=previous.freq_low,
+                    previous_freq_high=previous.freq_high,
+                    previous_start_time=_utc(previous.start_time),
+                    previous_end_time=_utc(previous.end_time),
+                    reason=payload.reason,
+                )
+                session.add(event)
+                session.flush()
+                response = {
+                    "amended": True,
+                    "application_id": application_id,
+                    "expected_revision": payload.expected_revision,
+                    "revision": meta.revision,
+                    "guard_band": settings.guard_band,
+                    "scope": {
+                        "circle": {
+                            "cx": event.cx,
+                            "cy": event.cy,
+                            "radius": event.radius,
+                        },
+                        "frequency": {
+                            "low": event.freq_low,
+                            "high": event.freq_high,
+                        },
+                        "time_window": {
+                            "start": iso(event.start_time),
+                            "end": iso(event.end_time),
+                        },
+                    },
+                    "previous_scope": {
+                        "circle": {
+                            "cx": event.previous_cx,
+                            "cy": event.previous_cy,
+                            "radius": event.previous_radius,
+                        },
+                        "frequency": {
+                            "low": event.previous_freq_low,
+                            "high": event.previous_freq_high,
+                        },
+                        "time_window": {
+                            "start": iso(event.previous_start_time),
+                            "end": iso(event.previous_end_time),
+                        },
+                    },
+                    "reason": payload.reason,
+                    "application": serialize_application(row, event),
+                }
+        except IntegrityError:
+            # Last line of defence (e.g. backends without row locks such as
+            # SQLite's tests): the revision slot was taken concurrently.
+            session.rollback()
+            latest = session.get(RevisionMeta, 1).revision
+            raise APIError(
+                E_STALE_REVISION,
+                f"the revision advanced concurrently (now {latest}); "
+                "re-check and retry the amendment",
                 status_code=409,
                 details={"current_revision": latest},
             )

@@ -56,3 +56,18 @@ class BatchApprovalRequest(BaseModel):
 
 class RevocationRequest(BaseModel):
     reason: str = Field(default="", max_length=2000)
+
+
+class AmendmentRequest(BaseModel):
+    """Conditional scope replacement for an approved-and-effective license.
+
+    Carries the *complete* new scope (circle, band, window) and the revision
+    the caller last observed; the same semantic rules as a new application
+    apply and are re-checked in semantic_validation.
+    """
+
+    expected_revision: int = Field(ge=0)
+    circle: CircleIn
+    frequency: FrequencyBandIn
+    time_window: TimeWindowIn
+    reason: str = Field(default="", max_length=2000)

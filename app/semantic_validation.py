@@ -2,12 +2,16 @@
 
 Any failure rejects the entire submission; the list contains one entry per
 violated rule.
+
+The scope rules (circle / band / window) are shared verbatim by new
+applications and by license amendments: an amendment carries the complete
+new scope and is validated exactly like an application.
 """
 from __future__ import annotations
 
 import math
 
-from .schemas import ApplicationCreate
+from .schemas import AmendmentRequest, ApplicationCreate
 
 RADIUS_NOT_POSITIVE = "radius_not_positive"
 FREQUENCY_LOW_ABOVE_HIGH = "frequency_low_above_high"
@@ -19,15 +23,21 @@ BATCH_DUPLICATE = "application_ids_not_unique"
 
 
 
-def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
+def validate_scope(circle, frequency, time_window) -> list[dict[str, str]]:
+    """Cross-field rules for one complete coverage scope.
+
+    Used for both ``POST /api/applications`` and
+    ``POST /api/applications/{id}/amendments``; the same field paths and
+    error codes are emitted so responses stay structurally identical.
+    """
     errors: list[dict[str, str]] = []
 
     numbers = {
-        "circle.cx": payload.circle.cx,
-        "circle.cy": payload.circle.cy,
-        "circle.radius": payload.circle.radius,
-        "frequency.low": payload.frequency.low,
-        "frequency.high": payload.frequency.high,
+        "circle.cx": circle.cx,
+        "circle.cy": circle.cy,
+        "circle.radius": circle.radius,
+        "frequency.low": frequency.low,
+        "frequency.high": frequency.high,
     }
     for field, value in numbers.items():
         if not math.isfinite(value):
@@ -39,7 +49,7 @@ def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
                 }
             )
 
-    if payload.circle.radius <= 0:
+    if circle.radius <= 0:
         errors.append(
             {
                 "field": "circle.radius",
@@ -48,7 +58,7 @@ def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
             }
         )
 
-    if payload.frequency.low > payload.frequency.high:
+    if frequency.low > frequency.high:
         errors.append(
             {
                 "field": "frequency.low",
@@ -57,8 +67,8 @@ def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
             }
         )
 
-    start = payload.time_window.start
-    end = payload.time_window.end
+    start = time_window.start
+    end = time_window.end
     if start.tzinfo is None or end.tzinfo is None:
         errors.append(
             {
@@ -78,6 +88,15 @@ def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
         )
 
     return errors
+
+
+def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
+    return validate_scope(payload.circle, payload.frequency, payload.time_window)
+
+
+def validate_amendment(payload: AmendmentRequest) -> list[dict[str, str]]:
+    """Same whole-scope checks as a new application (see validate_scope)."""
+    return validate_scope(payload.circle, payload.frequency, payload.time_window)
 
 
 def validate_batch_application_ids(application_ids: list[int]) -> list[dict[str, str]]:
