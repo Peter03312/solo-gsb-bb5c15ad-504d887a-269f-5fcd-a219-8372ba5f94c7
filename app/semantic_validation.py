@@ -1,11 +1,14 @@
 """Whole-request semantic validation.
 
 Any failure rejects the entire submission; the list contains one entry per
-violated rule.
+violated rule.  The same scope rules (positive radius, ordered frequency
+band, strictly earlier time window with timezone-aware instants) apply both
+to a new application and to a license scope adjustment.
 """
 from __future__ import annotations
 
 import math
+from typing import Protocol
 
 from .schemas import ApplicationCreate
 
@@ -18,8 +21,16 @@ BATCH_EMPTY = "application_ids_empty"
 BATCH_DUPLICATE = "application_ids_not_unique"
 
 
+class ScopePayload(Protocol):
+    """Structural shape shared by ApplicationCreate and AdjustmentRequest."""
 
-def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
+    circle: object
+    frequency: object
+    time_window: object
+
+
+def validate_scope(payload: ScopePayload) -> list[dict[str, str]]:
+    """All cross-field rules for one coverage circle / band / time window."""
     errors: list[dict[str, str]] = []
 
     numbers = {
@@ -78,6 +89,10 @@ def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
         )
 
     return errors
+
+
+def validate_application(payload: ApplicationCreate) -> list[dict[str, str]]:
+    return validate_scope(payload)
 
 
 def validate_batch_application_ids(application_ids: list[int]) -> list[dict[str, str]]:

@@ -2,15 +2,24 @@
 
 History is event-sourced:
 
-* ``applications``     - every submitted request, rejected submissions are
-                         never persisted (see whole-request validation);
-* ``approval_events``  - append-only approval record, one per revision;
-* ``revocation_events``- append-only revocation record, one per revision;
-* ``revision_meta``    - singleton row holding the current revision number.
+* ``applications``      - every submitted request, rejected submissions are
+                          never persisted (see whole-request validation); the
+                          row always carries the *current* scope, which is
+                          atomically replaced by an adjustment;
+* ``approval_events``   - append-only approval record, one per revision, with
+                          the immutable scope snapshot as originally approved;
+* ``adjustment_events`` - append-only scope-adjustment record (equipment
+                          relocation), one per revision, carrying the full new
+                          coverage circle / band / time window;
+* ``revocation_events`` - append-only revocation record, one per revision;
+* ``revision_meta``     - singleton row holding the current revision number.
 
 A revocation never deletes history: it only removes an application from the
-effective set used by later adjudications.  Snapshots for any past revision
-are reconstructed from the two event tables.
+effective set used by later adjudications.  An adjustment never changes the
+license id or its approved status: it appends an immutable event and replaces
+the effective scope.  Snapshots for any past revision are reconstructed from
+the event tables by replaying each license's approval and its later
+adjustments up to the requested revision.
 """
 from __future__ import annotations
 
@@ -83,7 +92,66 @@ class ApprovalEvent(Base):
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
+    # Immutable scope snapshot exactly as approved. Nullable only so that
+    # databases created before adjustments existed can be brought online;
+    # init_db() adds these columns and back-fills them from the application
+    # row (an application's scope is only ever replaced atomically, so any
+    # still-pending row's parameters equal those its approval recorded).
+    cx: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    radius: Mapped[float | None] = mapped_column(Float, nullable=True)
+    freq_low: Mapped[float | None] = mapped_column(Float, nullable=True)
+    freq_high: Mapped[float | None] = mapped_column(Float, nullable=True)
+    start_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    end_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     __table_args__ = (Index("ix_approval_events_application", "application_id"),)
+
+
+class AdjustmentEvent(Base):
+    """An atomic scope replacement of an approved license (equipment move).
+
+    One revision per event. The license id and approved status never change;
+    the full new coverage circle / frequency band / time window is stored here
+    immutably so as-of snapshots can replay the scope in force at any
+    revision.
+    """
+
+    __tablename__ = "adjustment_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False
+    )
+    # Revision at which the license was originally approved (its prior scope).
+    approval_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Snapshot of the guard band in force when the adjustment was adjudicated.
+    guard_band: Mapped[float] = mapped_column(Float, nullable=False)
+
+    # Full new scope (atomic replacement).
+    cx: Mapped[float] = mapped_column(Float, nullable=False)
+    cy: Mapped[float] = mapped_column(Float, nullable=False)
+    radius: Mapped[float] = mapped_column(Float, nullable=False)
+    freq_low: Mapped[float] = mapped_column(Float, nullable=False)
+    freq_high: Mapped[float] = mapped_column(Float, nullable=False)
+    start_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    end_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+    __table_args__ = (Index("ix_adjustment_events_application", "application_id"),)
 
 
 class RevocationEvent(Base):

@@ -11,8 +11,13 @@
 - **整组批准**：运营人员可携带一个预期修订号和非空、无重复的申请 ID 列表
   一次性批准整场活动的多台设备；同一事务内对**当前有效许可与组内申请**统一
   裁决，任一失败则整组不批准、修订号不变；全部通过则按输入顺序写入连续修订号
-- 撤销只改变后续裁决所用的**有效集合**；按修订号查询可还原当时全部批准、撤销记录
-  （整组批准产生的每个修订号都可查询，还原该设备获批那一刻的有效集合）
+- **搬迁调整**：已获批且未撤销的许可可因设备搬迁提交**完整新覆盖圆/频段/时段**
+  与预期修订号；锁内排除该许可**自身旧范围**后对其余有效许可重新裁决，通过即
+  以**一个新修订号原子替换**有效范围，许可 ID 与获批状态不变。旧修订号查询仍
+  呈现当时参数，调整后的查询及后续单笔、整组批准一律使用新范围
+- 撤销只改变后续裁决所用的**有效集合**；按修订号查询可还原当时全部批准、
+  调整、撤销记录（整组批准产生的每个修订号都可查询，还原该设备获批那一刻的
+  有效集合）
 
 ---
 
@@ -34,7 +39,8 @@ docker compose up --build
 - PostgreSQL：`localhost:5432`（库/用户/密码均为 `radio`）
 
 容器启动时 API 会自动等待数据库就绪，然后**建表并初始化修订号 0**，
-无需手工执行迁移。数据保存在命名卷 `radio_pgdata` 中；清空重来：
+无需手工执行迁移（旧版本数据库会在启动时幂等补齐调整功能所需的列并回填）。
+数据保存在命名卷 `radio_pgdata` 中；清空重来：
 
 ```bash
 docker compose down -v
@@ -59,7 +65,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 51 个用例）：
+运行测试（自动使用临时 SQLite 库，共 72 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -119,14 +125,29 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
      （间隔**恰好等于**保护带宽时允许，即“严格小于”）。
 
 裁决只考虑**有效集合**：已批准且未被撤销的申请。待审批、已撤销均不参与。
+有效许可参与裁决时使用其**当前范围**（原始获批范围叠加截至当前的最近一次搬迁
+调整）。
+
+### 搬迁调整（原子替换有效范围）
+
+- 只有**已获批且未撤销**的许可可调整；许可 ID、`approved` 状态与
+  `approval_revision`（原始获批修订号）**不变**。
+- 请求必须携带**完整新覆盖圆、频段、时段**与 `expected_revision`，沿用与新申请
+  完全相同的整笔语义校验。
+- 在修订号行锁内：先排除该许可**自身的旧范围**，再以新范围对**其余有效许可**
+  执行同一套干扰规则——因此搬到与自身旧位置重叠处不会与自己冲突。
+- 通过则占用**一个新修订号**：`applications` 行的范围被原子替换，并向
+  `adjustment_events` 追加一条不可变事件（完整新范围快照）。
+- 失败（不存在 / 待批 / 已撤销 / 参数非法 / 修订过期 / 干扰）时**旧范围继续
+  生效**，不产生调整事件、不产生新修订号。
 
 ### 修订号与并发模型
 
-- 初始修订号为 **0**；每次批准、**整组批准中的每项**或撤销都使修订号 +1，
-  并追加一条不可变事件。
+- 初始修订号为 **0**；每次批准、**整组批准中的每项**、每次**搬迁调整**或撤销都
+  使修订号 +1，并追加一条不可变事件。
 - `POST .../preview` 返回 `current_revision`、冲突对象及每个触发条件。
 - `POST .../approve` 必须携带 `expected_revision`。服务在 PostgreSQL
-  单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/撤销事务：
+  单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/调整/撤销事务：
   - `expected_revision != 当前修订号` → **409 `stale_revision`**（修订过期/被并发抢先）；
   - 号对但锁内**重新裁决**发现冲突 → **409 `interference`**（不得占用频段，响应体附冲突）；
   - 通过 → 写入批准事件，占用新修订号。
@@ -140,9 +161,15 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
   - 全部通过 → **一次提交**，按输入顺序为每项写入批准事件和**连续修订号**
     （`from_revision+1 … revision`）；按其中**任一修订号**查询即还原截至
     该项获批的有效集合（见 6.12）。
+- `POST .../{id}/adjust` 搬迁调整与单笔批准、整组批准、撤销共享**同一把行锁与
+  修订裁决**：锁内排除该许可自身旧范围后，以完整新范围对其余有效许可重新裁决；
+  修订过期 → **409 `stale_revision`**，干扰 → **409 `interference`**（旧范围继续
+  生效、`revised: false`）；通过 → 原子替换范围并占用一个新修订号，返回
+  `previous_scope` 与新 `scope`。
 - `POST .../revoke` 只把申请移出有效集合（产生新修订号），历史不删除。
-- `GET /api/revision/{n}` 还原修订号 **n 当时**的批准与撤销记录
-  （`n` 超过当前修订号返回 404）。
+- `GET /api/revision/{n}` 还原修订号 **n 当时**的批准、调整与撤销记录
+  （`n` 超过当前修订号返回 404）：每个许可的范围 = 其原始获批范围叠加截至 n
+  的最近一次调整，故旧修订号恒呈现旧参数。
 
 ---
 
@@ -156,6 +183,7 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `POST` | `/api/applications/{id}/preview` | 冲突预览（返回冲突对象、触发条件、当前修订号） |
 | `POST` | `/api/applications/{id}/approve` | 携带修订号批准（锁内重新裁决） |
 | `POST` | `/api/applications/batch-approve` | **整组批准**：一个修订号 + 非空无重复 ID 列表，全有或全无 |
+| `POST` | `/api/applications/{id}/adjust` | **搬迁调整**：完整新范围 + 预期修订号，锁内排除自身旧范围后原子替换 |
 | `POST` | `/api/applications/{id}/revoke` | 撤销（仅影响后续有效集合） |
 | `GET` | `/api/revision/current` | 当前修订号 + 有效集合 + 全部事件 |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录 |
@@ -169,13 +197,13 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 
 | HTTP | `error.code` | 触发场景 |
 | --- | --- | --- |
-| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组请求的空列表 `application_ids_empty`、重复 ID `application_ids_not_unique` 亦在此 |
+| 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组请求的空列表 `application_ids_empty`、重复 ID `application_ids_not_unique` 亦在此；搬迁调整的新范围非法同样整笔拒收 |
 | 404 | `not_found` | 申请不存在 |
 | 404 | `revision_out_of_range` | 查询了未来修订号 |
-| 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 |
-| 409 | `already_revoked` | 重复撤销 |
-| 409 | `stale_revision` | 修订号过期或被并发批准抢占 |
-| 409 | `interference` | 重新裁决发现干扰，频段未占用 |
+| 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 / 调整非已获批（待批）许可 |
+| 409 | `already_revoked` | 重复撤销 / 调整已撤销许可 |
+| 409 | `stale_revision` | 修订号过期或被并发批准/调整抢占 |
+| 409 | `interference` | 重新裁决发现干扰（含搬迁调整与其余有效许可），频段未占用、旧范围继续生效 |
 | 409 | `batch_rejected` | 整组批准任一失败：修订过期 / ID 无效 / 状态不符 / 组内外干扰，整组不批准且修订号不变 |
 
 ---
@@ -441,6 +469,97 @@ HTTP/1.1 409 Conflict
 脚本版走查：[`examples/batch_walkthrough.sh`](examples/batch_walkthrough.sh)
 （`./examples/batch_walkthrough.sh http://localhost:8000`）。
 
+### 6.13 搬迁调整（设备搬迁，原子替换有效范围）
+
+设备搬迁后，已获批且未撤销的许可可提交**许可 ID、完整新覆盖圆/频段/时段与
+预期修订号**。服务在修订锁内**排除该许可自身旧范围**，以新范围对其余有效
+许可重新裁决；通过后以**一个新修订号**原子替换有效范围，许可 ID 与获批
+状态不变。下例：许可 1 原在原点 `[100,110]`（修订号 1），许可 2 在
+`x=100` 的 `[200,210]`（修订号 2），把许可 1 搬到 `x=50`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/1/adjust \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_revision": 2,
+    "reason": "设备搬迁至新看台",
+    "circle":    {"cx": 50, "cy": 0, "radius": 10},
+    "frequency": {"low": 100, "high": 110},
+    "time_window": {"start": "2026-10-01T08:00:00Z", "end": "2026-10-01T10:00:00Z"}
+  }'
+```
+
+```json
+{
+  "adjusted": true,
+  "application_id": 1,
+  "revision": 3,
+  "previous_revision": 2,
+  "approval_revision": 1,
+  "guard_band": 2.0,
+  "previous_scope": {
+    "circle": {"cx": 0.0, "cy": 0.0, "radius": 10.0},
+    "frequency": {"low": 100.0, "high": 110.0},
+    "time_window": {"start": "2026-10-01T08:00:00Z", "end": "2026-10-01T10:00:00Z"}
+  },
+  "scope": {
+    "circle": {"cx": 50.0, "cy": 0.0, "radius": 10.0},
+    "frequency": {"low": 100.0, "high": 110.0},
+    "time_window": {"start": "2026-10-01T08:00:00Z", "end": "2026-10-01T10:00:00Z"}
+  },
+  "reason": "设备搬迁至新看台",
+  "application": {"id": 1, "status": "approved", "approval_revision": 1, "...": "..."}
+}
+```
+
+旧修订号查询仍呈现**当时参数**；调整所在修订号及之后的查询、后续单笔/整组
+批准都使用**新范围**：
+
+```bash
+curl -s http://localhost:8000/api/revision/1
+# {"revision": 1, "effective_application_ids": [1],
+#  "approvals": [{"revision": 1, "application_id": 1, "status_as_of": "approved",
+#                 "application": {"circle": {"cx": 0.0, ...}, ...}}],
+#  "adjustments": [], "revocations": []}
+
+curl -s http://localhost:8000/api/revision/3
+# {"revision": 3, ...,
+#  "approvals": [{"revision": 1, ..., "adjusted_at_revision": 3,
+#                 "application": {"circle": {"cx": 50.0, ...}, ...}}],
+#  "adjustments": [{"revision": 3, "application_id": 1, "approval_revision": 1,
+#                   "scope": {"circle": {"cx": 50.0, ...}, ...}}]}
+
+# 旧原点现在空出：在原点同频段同时段的新申请可正常预览/批准
+curl -s -X POST http://localhost:8000/api/applications/3/preview
+# {"current_revision": 3, "has_conflicts": false, ...}
+```
+
+失败时**旧范围继续生效、不产生调整事件或新修订号**，均返回具体原因：
+
+```bash
+# 搬到与许可 2 冲突的范围 -> 409 interference（details.revised=false，附冲突对象）
+curl -i -X POST http://localhost:8000/api/applications/1/adjust \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_revision": 3,
+       "circle": {"cx": 100, "cy": 0, "radius": 10},
+       "frequency": {"low": 200, "high": 210},
+       "time_window": {"start": "2026-10-01T08:00:00Z", "end": "2026-10-01T10:00:00Z"}}'
+# HTTP/1.1 409 Conflict
+# {"error": {"code": "interference",
+#   "details": {"current_revision": 3, "revised": false,
+#               "conflicts": [{"application": {"id": 2, ...}, "reason": "..."}]}}}
+
+# 修订过期 -> 409 stale_revision（expected 2，current 3）
+# 参数非法（半径非正 / 频段倒置 / 时段非法）-> 422 validation_failed，整笔拒收
+# 许可不存在 -> 404 not_found；待批 -> 409 not_pending；已撤销 -> 409 already_revoked
+```
+
+调整与单笔批准、整组批准、撤销在 PostgreSQL 上共享同一行锁：并发事务串行
+裁决，抢占失败一方收到 `stale_revision`，按当前修订号重新决定后重试即可。
+
+脚本版走查：[`examples/adjust_walkthrough.sh`](examples/adjust_walkthrough.sh)
+（`./examples/adjust_walkthrough.sh http://localhost:8000`）。
+
 ---
 
 ## 7. 项目结构
@@ -452,16 +571,18 @@ HTTP/1.1 409 Conflict
 │   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决
 │   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验
 │   ├── schemas.py              # Pydantic 请求模型
-│   ├── models.py               # SQLAlchemy 表（申请 + 批准/撤销事件 + 修订号）
-│   ├── db.py                   # 引擎、等待数据库、建表与修订号初始化
+│   ├── models.py               # SQLAlchemy 表（申请 + 批准/调整/撤销事件 + 修订号）
+│   ├── db.py                   # 引擎、等待数据库、建表/旧库补列回填与修订号初始化
 │   ├── config.py               # 环境变量配置
 │   └── errors.py               # 统一错误信封
 ├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite）
 │   ├── test_adjudication.py
 │   ├── test_api.py             # 单笔提交/预览/批准/撤销/历史
-│   └── test_batch_approve.py   # 整组批准、组内冲突、并发裁决
+│   ├── test_batch_approve.py   # 整组批准、组内冲突、并发裁决
+│   └── test_adjustment.py      # 搬迁调整、范围快照重放、旧库升级
 ├── examples/walkthrough.sh     # curl 走查脚本（单笔）
 ├── examples/batch_walkthrough.sh # curl 走查脚本（整组批准）
+├── examples/adjust_walkthrough.sh # curl 走查脚本（搬迁调整）
 ├── Dockerfile
 ├── docker-compose.yml          # db + api 一键启动
 ├── requirements.txt / requirements-dev.txt

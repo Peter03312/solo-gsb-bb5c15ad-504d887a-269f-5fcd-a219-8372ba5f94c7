@@ -8,6 +8,10 @@ semantic_validation so the whole request is rejected with explicit codes:
 * ``freq_low`` may not exceed ``freq_high`` (equal is allowed, a single
   frequency);
 * ``start_time`` must be strictly earlier than ``end_time``.
+
+These same rules apply both to a new application and to a license scope
+adjustment (equipment relocation); the adjustment endpoint reuses the nested
+circle / band / time-window models verbatim.
 """
 from __future__ import annotations
 
@@ -55,4 +59,17 @@ class BatchApprovalRequest(BaseModel):
 
 
 class RevocationRequest(BaseModel):
+    reason: str = Field(default="", max_length=2000)
+
+
+class AdjustmentRequest(BaseModel):
+    # Conditional exactly like (batch) approval: the caller states the
+    # revision it based its decision on; re-adjudication happens under lock.
+    expected_revision: int = Field(ge=0)
+    # Complete replacement scope (the relocated equipment). All three parts
+    # are required and go through the same semantic rules as a new
+    # application; an identical scope is a legal (no-op) replacement.
+    circle: CircleIn
+    frequency: FrequencyBandIn
+    time_window: TimeWindowIn
     reason: str = Field(default="", max_length=2000)
